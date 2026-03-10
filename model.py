@@ -82,6 +82,8 @@ print("\nFetching 2026 current standings...")
 current_season = fetch_season_data(2026)
 current_df = pd.DataFrame(current_season)
 
+current_df["points_pct"] = current_df["points"] / (current_df["points"].max())
+current_df["wins_pct"] = current_df["wins"] / (current_df["wins"].max() if current_df["wins"].max() > 0 else 1)
 current_df["win_probability"] = model.predict_proba(current_df[features])[:, 1]
 current_df = current_df.sort_values("win_probability", ascending=False)
 
