@@ -24,12 +24,35 @@ app.add_middleware(
 cache_dir = os.path.join(os.path.dirname(__file__), "f1_cache")
 os.makedirs(cache_dir, exist_ok=True)
 fastf1.Cache.enable_cache(cache_dir)
+import json
+
+_cache = {}
+_cache_file = os.path.join(os.path.dirname(__file__), "api_cache.json")
+
+# Load cache from disk on startup
+if os.path.exists(_cache_file):
+    with open(_cache_file, "r") as f:
+        _cache = json.load(f)
+    print(f"Loaded {len(_cache)} cached items from disk")
+
+def cache_get(key):
+    return _cache.get(key)
+
+def cache_set(key, value):
+    _cache[key] = value
+    with open(_cache_file, "w") as f:
+        json.dump(_cache, f)
 
 # ─── DATA FETCHING ────────────────────────────────────────────────────────────
 def fetch_season_standings(year):
     url = f"https://api.jolpi.ca/ergast/f1/{year}/driverStandings.json"
-    response = requests.get(url)
-    data = response.json()
+    try:
+        response = requests.get(url, timeout=10)
+        if not response.text.strip():
+            return None
+        data = response.json()
+    except Exception:
+        return None
     standings = data["MRData"]["StandingsTable"]["StandingsLists"]
     if not standings:
         return None
@@ -57,9 +80,14 @@ def fetch_season_standings(year):
 
 def fetch_race_results(year):
     url = f"https://api.jolpi.ca/ergast/f1/{year}/results.json?limit=500"
-    response = requests.get(url)
-    data = response.json()
-    races = data["MRData"]["RaceTable"]["Races"]
+    try:
+        response = requests.get(url, timeout=10)
+        if not response.text.strip():
+            return []
+        data = response.json()
+        races = data["MRData"]["RaceTable"]["Races"]
+    except Exception:
+        return []
     results = []
     for race in races:
         for result in race["Results"]:
@@ -88,8 +116,13 @@ def fetch_race_results(year):
 
 def fetch_mid_season_standings(year, after_round):
     url = f"https://api.jolpi.ca/ergast/f1/{year}/{after_round}/driverStandings.json"
-    response = requests.get(url)
-    data = response.json()
+    try:
+        response = requests.get(url, timeout=10)
+        if not response.text.strip():
+            return None
+        data = response.json()
+    except Exception:
+        return None
     standings = data["MRData"]["StandingsTable"]["StandingsLists"]
     if not standings:
         return None
@@ -115,6 +148,10 @@ def fetch_mid_season_standings(year, after_round):
     return results
 
 def fetch_car_pace(year, round_num):
+    cache_key = f"pace_{year}_{round_num}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         session = fastf1.get_session(year, round_num, 'R')
         session.load(telemetry=False, weather=False, messages=False)
@@ -125,7 +162,9 @@ def fetch_car_pace(year, round_num):
         driver_pace_seconds = driver_pace.dt.total_seconds()
         min_pace = driver_pace_seconds.min()
         pace_rating = (min_pace / driver_pace_seconds) * 100
-        return pace_rating.to_dict()
+        result = pace_rating.to_dict()
+        cache_set(cache_key, result)
+        return result
     except Exception:
         return {}
 
@@ -147,6 +186,10 @@ def fetch_qualifying_results(year, round_num):
     return qualifying
 
 def fetch_circuit_history(driver_code, circuit_id, current_team, years=5):
+    cache_key = f"circuit_{driver_code}_{circuit_id}_{current_team}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
     results = []
     current_year = 2026
     for year in range(current_year - years, current_year):
@@ -177,11 +220,13 @@ def fetch_circuit_history(driver_code, circuit_id, current_team, years=5):
         return {"circuit_avg_finish": 10.0, "circuit_avg_points": 5.0, "circuit_podium_rate": 0.0}
 
     df = pd.DataFrame(results)
-    return {
+    result = {
         "circuit_avg_finish": df["finish_pos"].mean(),
         "circuit_avg_points": df["points"].mean(),
         "circuit_podium_rate": df["podium"].mean(),
     }
+    cache_set(cache_key, result)
+    return result
 
 def fetch_car_development(team, year):
     try:
@@ -302,11 +347,13 @@ all_mid_standings = []
 all_final_standings = []
 all_races = []
 
+import time
 for year in range(2010, 2026):
     print(f"  Loading {year}...")
     mid = fetch_mid_season_standings(year, 1)
     final = fetch_season_standings(year)
     races = fetch_race_results(year)
+    time.sleep(0.3)
     if mid: all_mid_standings.extend(mid)
     if final: all_final_standings.extend(final)
     if races: all_races.extend(races)
@@ -436,6 +483,11 @@ def predict_race(round_num: int):
 
 @app.get("/api/race/enhanced/{round_num}/{circuit_id}")
 def predict_race_enhanced(round_num: int, circuit_id: str):
+    cache_key = f"enhanced_{round_num}_{circuit_id}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     qualifying = fetch_qualifying_results(2026, round_num)
     standings = fetch_mid_season_standings(2026, round_num - 1 if round_num > 1 else 1)
     races = fetch_race_results(2026)
@@ -492,8 +544,10 @@ def predict_race_enhanced(round_num: int, circuit_id: str):
         p["win_probability"] = round(max(p["score"], 0) / total_score * 100, 1) if total_score > 0 else 0
         del p["score"]
 
-    return {
+    result = {
         "round": round_num,
         "circuit": circuit_id,
         "predictions": predictions[:10]
     }
+    cache_set(cache_key, result)
+    return result
