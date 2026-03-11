@@ -131,6 +131,24 @@ def fetch_car_pace(year, round_num):
     except Exception as e:
         return {}
 
+def fetch_qualifying_results(year, round_num):
+    url = f"https://api.jolpi.ca/ergast/f1/{year}/{round_num}/qualifying.json"
+    response = requests.get(url)
+    data = response.json()
+    races = data["MRData"]["RaceTable"]["Races"]
+    if not races:
+        return {}
+    
+    qualifying = {}
+    for result in races[0]["QualifyingResults"]:
+        try:
+            driver = result["Driver"]["code"]
+            position = int(result["position"])
+            qualifying[driver] = position
+        except Exception:
+            continue
+    return qualifying
+
 def build_features(mid_standings_df, race_df, final_standings_df=None, use_fastf1=False, year_races=None):
     enriched = []
     for _, row in mid_standings_df.iterrows():
@@ -283,3 +301,53 @@ def get_standings():
     if not standings:
         return {"error": "Could not fetch standings"}
     return {"standings": standings}
+@app.get("/api/race/{round_num}")
+def predict_race(round_num: int):
+    qualifying = fetch_qualifying_results(2026, round_num)
+    standings = fetch_mid_season_standings(2026, round_num - 1 if round_num > 1 else 1)
+    races = fetch_race_results(2026)
+
+    if not standings or not races:
+        return {"error": "Could not fetch data"}
+
+    mid_df = pd.DataFrame(standings)
+    race_df_2026 = pd.DataFrame(races)
+    current_df = build_features(mid_df, race_df_2026)
+
+    pace_data = fetch_car_pace(2026, round_num - 1 if round_num > 1 else 1)
+
+    predictions = []
+    for _, row in current_df.iterrows():
+        driver = row["driver"]
+        base_score = row["points_per_race"] * 0.4 + row["podium_rate"] * 50 + row["win_rate"] * 100
+        
+        # Qualifying boost — starting position matters a lot
+        quali_pos = qualifying.get(driver, 15)
+        quali_boost = (20 - quali_pos) * 3
+        
+        # Pace boost from FastF1
+        pace_boost = (pace_data.get(driver, 95) - 95) * 2
+        
+        # DNF penalty
+        dnf_penalty = row["dnf_rate"] * 20
+        
+        final_score = base_score + quali_boost + pace_boost - dnf_penalty
+        predictions.append({
+            "driver": driver,
+            "team": row["team"],
+            "score": final_score,
+            "qualifying_position": quali_pos,
+            "pace_rating": round(pace_data.get(driver, 95.0), 1),
+        })
+
+    predictions.sort(key=lambda x: x["score"], reverse=True)
+    total_score = sum(max(p["score"], 0) for p in predictions)
+    
+    for p in predictions:
+        p["win_probability"] = round(max(p["score"], 0) / total_score * 100, 1) if total_score > 0 else 0
+        del p["score"]
+
+    return {
+        "round": round_num,
+        "predictions": predictions[:10]
+    }
