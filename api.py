@@ -14,7 +14,6 @@ warnings.filterwarnings('ignore')
 # ─── SETUP ────────────────────────────────────────────────────────────────────
 app = FastAPI()
 
-# Allow your React app to call this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,12 +21,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# FastF1 cache
 cache_dir = os.path.join(os.path.dirname(__file__), "f1_cache")
 os.makedirs(cache_dir, exist_ok=True)
 fastf1.Cache.enable_cache(cache_dir)
 
-# ─── COPY ALL YOUR FUNCTIONS FROM model.py ────────────────────────────────────
+# ─── DATA FETCHING ────────────────────────────────────────────────────────────
 def fetch_season_standings(year):
     url = f"https://api.jolpi.ca/ergast/f1/{year}/driverStandings.json"
     response = requests.get(url)
@@ -128,7 +126,7 @@ def fetch_car_pace(year, round_num):
         min_pace = driver_pace_seconds.min()
         pace_rating = (min_pace / driver_pace_seconds) * 100
         return pace_rating.to_dict()
-    except Exception as e:
+    except Exception:
         return {}
 
 def fetch_qualifying_results(year, round_num):
@@ -138,7 +136,6 @@ def fetch_qualifying_results(year, round_num):
     races = data["MRData"]["RaceTable"]["Races"]
     if not races:
         return {}
-    
     qualifying = {}
     for result in races[0]["QualifyingResults"]:
         try:
@@ -149,6 +146,98 @@ def fetch_qualifying_results(year, round_num):
             continue
     return qualifying
 
+def fetch_circuit_history(driver_code, circuit_id, current_team, years=5):
+    results = []
+    current_year = 2026
+    for year in range(current_year - years, current_year):
+        try:
+            url = f"https://api.jolpi.ca/ergast/f1/{year}/circuits/{circuit_id}/results.json"
+            response = requests.get(url)
+            data = response.json()
+            races = data["MRData"]["RaceTable"]["Races"]
+            if not races:
+                continue
+            for result in races[0]["Results"]:
+                if result["Driver"]["code"] == driver_code:
+                    team_at_time = result["Constructor"]["name"]
+                    if team_at_time != current_team:
+                        continue
+                    finish_pos = int(result["position"])
+                    points = float(result.get("points", 0))
+                    results.append({
+                        "year": year,
+                        "finish_pos": finish_pos,
+                        "points": points,
+                        "podium": 1 if finish_pos <= 3 else 0,
+                    })
+        except Exception:
+            continue
+
+    if not results:
+        return {"circuit_avg_finish": 10.0, "circuit_avg_points": 5.0, "circuit_podium_rate": 0.0}
+
+    df = pd.DataFrame(results)
+    return {
+        "circuit_avg_finish": df["finish_pos"].mean(),
+        "circuit_avg_points": df["points"].mean(),
+        "circuit_podium_rate": df["podium"].mean(),
+    }
+
+def fetch_car_development(team, year):
+    try:
+        url = f"https://api.jolpi.ca/ergast/f1/{year}/constructorStandings.json"
+        response = requests.get(url)
+        data = response.json()
+        standings = data["MRData"]["StandingsTable"]["StandingsLists"]
+        if not standings:
+            return 1.0
+
+        url_r1 = f"https://api.jolpi.ca/ergast/f1/{year}/1/constructorStandings.json"
+        r1 = requests.get(url_r1).json()
+        r1_standings = r1["MRData"]["StandingsTable"]["StandingsLists"]
+        if not r1_standings:
+            return 1.0
+
+        final_pts = next((float(c["points"]) for c in standings[0]["ConstructorStandings"]
+                         if c["Constructor"]["name"] == team), 0)
+        r1_pts = next((float(c["points"]) for c in r1_standings[0]["ConstructorStandings"]
+                      if c["Constructor"]["name"] == team), 0)
+
+        if r1_pts == 0:
+            return 1.0
+
+        raw_ratio = final_pts / r1_pts if r1_pts > 0 else 1.0
+        capped = max(0.8, min(1.3, 1.0 + (raw_ratio - 10) / 100))
+        return round(capped, 2)
+    except Exception:
+        return 1.0
+
+def fetch_teammate_comparison(driver_code, team, year):
+    try:
+        url = f"https://api.jolpi.ca/ergast/f1/{year}/driverStandings.json"
+        response = requests.get(url)
+        data = response.json()
+        standings = data["MRData"]["StandingsTable"]["StandingsLists"]
+        if not standings:
+            return 1.0
+
+        team_drivers = [
+            float(d["points"]) for d in standings[0]["DriverStandings"]
+            if d["Constructors"][0]["name"] == team
+        ]
+        driver_pts = next(
+            (float(d["points"]) for d in standings[0]["DriverStandings"]
+             if d["Driver"]["code"] == driver_code), 0
+        )
+
+        if len(team_drivers) < 2 or sum(team_drivers) == 0:
+            return 1.0
+
+        return round(driver_pts / (sum(team_drivers) / len(team_drivers)), 2)
+    except Exception:
+        return 1.0
+
+# ─── FEATURE BUILDER ─────────────────────────────────────────────────────────
 def build_features(mid_standings_df, race_df, final_standings_df=None, use_fastf1=False, year_races=None):
     enriched = []
     for _, row in mid_standings_df.iterrows():
@@ -243,7 +332,6 @@ rf.fit(X_train, y_train)
 gb = GradientBoostingRegressor(n_estimators=200, random_state=42)
 gb.fit(X_train, y_train)
 
-from sklearn.metrics import mean_absolute_error
 rf_mae = mean_absolute_error(y_test, rf.predict(X_test))
 gb_mae = mean_absolute_error(y_test, gb.predict(X_test))
 model = rf if rf_mae <= gb_mae else gb
@@ -301,6 +389,7 @@ def get_standings():
     if not standings:
         return {"error": "Could not fetch standings"}
     return {"standings": standings}
+
 @app.get("/api/race/{round_num}")
 def predict_race(round_num: int):
     qualifying = fetch_qualifying_results(2026, round_num)
@@ -320,17 +409,10 @@ def predict_race(round_num: int):
     for _, row in current_df.iterrows():
         driver = row["driver"]
         base_score = row["points_per_race"] * 0.4 + row["podium_rate"] * 50 + row["win_rate"] * 100
-        
-        # Qualifying boost — starting position matters a lot
         quali_pos = qualifying.get(driver, 15)
         quali_boost = (20 - quali_pos) * 3
-        
-        # Pace boost from FastF1
         pace_boost = (pace_data.get(driver, 95) - 95) * 2
-        
-        # DNF penalty
         dnf_penalty = row["dnf_rate"] * 20
-        
         final_score = base_score + quali_boost + pace_boost - dnf_penalty
         predictions.append({
             "driver": driver,
@@ -342,12 +424,76 @@ def predict_race(round_num: int):
 
     predictions.sort(key=lambda x: x["score"], reverse=True)
     total_score = sum(max(p["score"], 0) for p in predictions)
-    
+
     for p in predictions:
         p["win_probability"] = round(max(p["score"], 0) / total_score * 100, 1) if total_score > 0 else 0
         del p["score"]
 
     return {
         "round": round_num,
+        "predictions": predictions[:10]
+    }
+
+@app.get("/api/race/enhanced/{round_num}/{circuit_id}")
+def predict_race_enhanced(round_num: int, circuit_id: str):
+    qualifying = fetch_qualifying_results(2026, round_num)
+    standings = fetch_mid_season_standings(2026, round_num - 1 if round_num > 1 else 1)
+    races = fetch_race_results(2026)
+
+    if not standings or not races:
+        return {"error": "Could not fetch data"}
+
+    mid_df = pd.DataFrame(standings)
+    race_df_2026 = pd.DataFrame(races)
+    current_df = build_features(mid_df, race_df_2026)
+
+    pace_data = fetch_car_pace(2026, round_num - 1 if round_num > 1 else 1)
+
+    print(f"Fetching enhanced features for {circuit_id}...")
+    predictions = []
+    for _, row in current_df.iterrows():
+        driver = row["driver"]
+        team = row["team"]
+
+        base_score = row["points_per_race"] * 0.4 + row["podium_rate"] * 50 + row["win_rate"] * 100
+        quali_pos = qualifying.get(driver, 15)
+        quali_boost = (20 - quali_pos) * 3
+        pace_boost = (pace_data.get(driver, 95) - 95) * 2
+        dnf_penalty = row["dnf_rate"] * 20
+
+        circuit_history = fetch_circuit_history(driver, circuit_id, team)
+        circuit_boost = (10 - circuit_history["circuit_avg_finish"]) * 2
+        circuit_boost += circuit_history["circuit_podium_rate"] * 20
+
+        dev_ratio = fetch_car_development(team, 2025)
+        dev_boost = (dev_ratio - 1.0) * 10
+
+        teammate_ratio = fetch_teammate_comparison(driver, team, 2026)
+        teammate_boost = (teammate_ratio - 1.0) * 15
+
+        final_score = base_score + quali_boost + pace_boost - dnf_penalty + circuit_boost + dev_boost + teammate_boost
+
+        predictions.append({
+            "driver": driver,
+            "team": team,
+            "score": final_score,
+            "qualifying_position": quali_pos,
+            "pace_rating": round(pace_data.get(driver, 95.0), 1),
+            "circuit_avg_finish": round(circuit_history["circuit_avg_finish"], 1),
+            "circuit_podium_rate": round(circuit_history["circuit_podium_rate"] * 100, 1),
+            "dev_ratio": dev_ratio,
+            "teammate_ratio": teammate_ratio,
+        })
+
+    predictions.sort(key=lambda x: x["score"], reverse=True)
+    total_score = sum(max(p["score"], 0) for p in predictions)
+
+    for p in predictions:
+        p["win_probability"] = round(max(p["score"], 0) / total_score * 100, 1) if total_score > 0 else 0
+        del p["score"]
+
+    return {
+        "round": round_num,
+        "circuit": circuit_id,
         "predictions": predictions[:10]
     }
