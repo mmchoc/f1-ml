@@ -169,21 +169,33 @@ def fetch_car_pace(year, round_num):
         return {}
 
 def fetch_qualifying_results(year, round_num):
-    url = f"https://api.jolpi.ca/ergast/f1/{year}/{round_num}/qualifying.json"
-    response = requests.get(url)
-    data = response.json()
-    races = data["MRData"]["RaceTable"]["Races"]
-    if not races:
+    cache_key = f"qualifying_{year}_{round_num}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        url = f"https://api.jolpi.ca/ergast/f1/{year}/{round_num}/qualifying.json"
+        response = requests.get(url, timeout=10)
+        if not response.text.strip():
+            return {}
+        data = response.json()
+        races = data["MRData"]["RaceTable"]["Races"]
+        if not races:
+            return {}
+        qualifying = {}
+        for result in races[0]["QualifyingResults"]:
+            try:
+                driver = result["Driver"]["code"]
+                position = int(result["position"])
+                qualifying[driver] = position
+            except Exception:
+                continue
+        cache_set(cache_key, qualifying)
+        return qualifying
+    except Exception:
         return {}
-    qualifying = {}
-    for result in races[0]["QualifyingResults"]:
-        try:
-            driver = result["Driver"]["code"]
-            position = int(result["position"])
-            qualifying[driver] = position
-        except Exception:
-            continue
-    return qualifying
+
 
 def fetch_circuit_history(driver_code, circuit_id, current_team, years=5):
     cache_key = f"circuit_{driver_code}_{circuit_id}_{current_team}"
@@ -489,6 +501,10 @@ def predict_race_enhanced(round_num: int, circuit_id: str):
         return cached
 
     qualifying = fetch_qualifying_results(2026, round_num)
+    if not qualifying:
+        pace = fetch_car_pace(2026, round_num - 1 if round_num > 1 else 1)
+        sorted_drivers = sorted(pace.items(), key=lambda x: -x[1])
+        qualifying = {driver: i + 1 for i, (driver, _) in enumerate(sorted_drivers)}
     standings = fetch_mid_season_standings(2026, round_num - 1 if round_num > 1 else 1)
     races = fetch_race_results(2026)
 
