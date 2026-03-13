@@ -1,0 +1,6 @@
+f1_cache/
+training_data_cache.pkl
+f1_model.joblib
+f1_scaler.joblib
+__pycache__/
+*.pyc
