@@ -69,7 +69,7 @@
   ],
   "samples": 2893,
   "ensemble": false,
-  "trained_at": "2026-03-13 10:41:37",
+  "trained_at": "2026-03-13 10:55:03",
   "feature_importance": {
     "pole_points_rate": 0.380521,
     "points_per_race": 0.11972,
