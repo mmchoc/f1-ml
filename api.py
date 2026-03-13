@@ -567,3 +567,34 @@ def predict_race_enhanced(round_num: int, circuit_id: str):
     }
     cache_set(cache_key, result)
     return result
+# Pre-cache all upcoming races on startup
+def precache_upcoming_races():
+    upcoming = [
+        (2, "shanghai"),
+        (3, "suzuka"),
+        (4, "bahrain"),
+        (5, "jeddah"),
+    ]
+    for round_num, circuit_id in upcoming:
+        print(f"Pre-caching {circuit_id}...")
+        predict_race_enhanced(round_num, circuit_id)
+    print("All races pre-cached!")
+
+import threading
+threading.Thread(target=precache_upcoming_races, daemon=True).start()
+@app.get("/api/schedule")
+def get_schedule():
+    cache_key = "schedule_2026"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        url = "https://api.jolpi.ca/ergast/f1/2026.json"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        races = data["MRData"]["RaceTable"]["Races"]
+        result = [{"round": int(r["round"]), "name": r["raceName"], "circuit": r["Circuit"]["circuitId"], "country": r["Circuit"]["Location"]["country"]} for r in races]
+        cache_set(cache_key, result)
+        return result
+    except Exception:
+        return []
