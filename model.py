@@ -1,25 +1,22 @@
 """
 F1 Championship Prediction Model — v4 (Maximum Depth)
 ======================================================
-Changes from v3:
-- Every single round sampled per season (was 6 fixed splits)
-  → 5-10x more training data
-- Optuna hyperparameter optimisation (50 trials, finds best params automatically)
-- Ensemble: XGBoost + LightGBM + RandomForest (averaged predictions)
-- Rolling window features: form over last 1, 3, 5 races separately
-- Head-to-head win rate vs every other driver in field (not just top 3)
-- Pit stop strategy features from FastF1
-- Qualifying gap consistency (not just average)
-- Season stage feature: early/mid/late season context
-- Uncertainty estimation: prediction intervals per driver
-- Per-circuit-type pace (high-speed, technical, street separately)
-- Better target leakage prevention
+- Every single round sampled per season (~3000+ training samples)
+- FastF1 fetched ONCE per year (end of season) applied to all snapshots
+- Ensemble: XGBoost + LightGBM + GradientBoosting
+- Rolling form windows: last 1, 3, 5 races
+- H2H vs field, vs top3, vs teammate
+- Circuit type splits (street, high-speed, technical)
+- Season stage context, qualifying consistency, streak scoring
+- Optuna hyperparameter tuning (--tune flag)
+- Data cache — fast retrains after first run
 
 Usage:
     python model.py              # Train and save
     python model.py --retrain    # Force retrain
+    python model.py --no-cache   # Re-fetch all data from scratch
     python model.py --evaluate   # Full report
-    python model.py --tune       # Run Optuna tuning first (slow but best results)
+    python model.py --tune       # Run Optuna tuning (50 trials)
 """
 
 import argparse
@@ -34,7 +31,7 @@ import joblib
 import fastf1
 import xgboost as xgb
 import lightgbm as lgb
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler
@@ -64,14 +61,9 @@ SEASON_WEIGHTS = {
     2025: 1.00,
 }
 
-# Sample EVERY round from round 3 onwards
-# (round 1-2 too sparse for meaningful features)
 MIN_ROUNDS_FOR_SNAPSHOT = 3
+IMPORTANCE_THRESHOLD    = 0.015
 
-# Aggressive importance threshold
-IMPORTANCE_THRESHOLD = 0.015
-
-# Circuit type classifications
 HIGH_SPEED_CIRCUITS = {
     "monza", "spa", "silverstone", "red_bull_ring", "zandvoort"
 }
@@ -82,89 +74,75 @@ STREET_CIRCUITS = {
     "monaco", "baku", "marina_bay", "jeddah", "vegas",
     "miami", "losail", "rodriguez", "albert_park"
 }
-
-# Known wet races
 WET_RACES = {
     (2019, 3), (2019, 14), (2020, 14),
     (2021, 15), (2022, 13), (2022, 18),
-    (2023, 6), (2023, 9), (2024, 8),
+    (2023, 6),  (2023, 9),  (2024, 8),
 }
 
 ALL_FEATURES = [
-    # ── Championship standing ─────────────────────────────────────────────
-    "points_pct",                    # points / max possible at this stage
-    "points_gap_to_leader",          # normalised gap to leader
-    "points_gap_to_p3",              # normalised gap to p3 (podium battle)
-    "mid_position",                  # current championship position
-    "season_stage",                  # 0-1 how far through season (early/late context)
-
-    # ── Wins & podiums ────────────────────────────────────────────────────
-    "composite_win_score",           # merged win rate (no redundancy)
-    "podium_rate",                   # podium rate
-    "points_per_race",               # avg points per race
-    "top5_rate",                     # top 5 finish rate
-
-    # ── Recent form (rolling windows) ─────────────────────────────────────
-    "form_last1",                    # points in last 1 race vs season avg
-    "form_last3",                    # points in last 3 races vs season avg
-    "form_last5",                    # points in last 5 races vs season avg
-    "form_trend",                    # slope: is form improving or declining?
-    "streak_score",                  # current consecutive points-scoring streak
-
-    # ── Qualifying ────────────────────────────────────────────────────────
-    "avg_grid",                      # avg qualifying position
-    "qualifying_consistency",        # std of qualifying positions (lower = more consistent)
-    "qualifying_ms_advantage",       # ms gap to teammate in qualifying (FastF1 2022+)
-    "front_row_rate",                # % of races starting from front row
-
-    # ── Race execution ────────────────────────────────────────────────────
-    "avg_positions_gained",          # avg grid vs finish delta
-    "overtaking_rate",               # positions gained starting from P6+
-    "pole_points_rate",              # avg points when starting from pole
-    "pole_execution_delta",          # pole vs non-pole points delta
-    "top_half_grid_points_rate",     # avg points when qualifying in top half
-
-    # ── Pace (FastF1 2022+ only) ──────────────────────────────────────────
-    "pace_vs_field",                 # median lap delta vs field
-    "sector1_advantage",             # sector 1 delta vs field
-    "sector2_advantage",             # sector 2 delta vs field
-    "sector3_advantage",             # sector 3 delta vs field
-    "pace_consistency",              # std of lap deltas (lower = more consistent)
-    "high_speed_pace",               # pace on high speed circuits specifically
-    "technical_pace",                # pace on technical circuits specifically
-
-    # ── Tyre & strategy (FastF1 2022+) ───────────────────────────────────
-    "tyre_deg_rate",                 # degradation slope per stint
-    "avg_stint_length",              # average stint length
-    "undercut_success_rate",         # % of pit stops where gained net position
-    "overcut_success_rate",          # % of stints where held off undercut
-
-    # ── Reliability ───────────────────────────────────────────────────────
-    "dnf_rate",                      # overall DNF rate
-    "mechanical_dnf_rate",           # mechanical DNFs only
-    "safety_margin_score",           # avg gap to next DNF position when finishing
-
-    # ── Circuit type performance ──────────────────────────────────────────
-    "street_circuit_avg_finish",     # avg finish on street circuits
-    "permanent_circuit_avg_finish",  # avg finish on permanent tracks
-    "high_speed_avg_finish",         # avg finish at high speed venues
-
-    # ── Head-to-head ──────────────────────────────────────────────────────
-    "h2h_vs_field",                  # win rate head to head vs entire field
-    "h2h_vs_top3",                   # win rate vs top 3 specifically
-    "teammate_h2h",                  # win rate vs direct teammate
-
-    # ── Team factors (non-leaking) ────────────────────────────────────────
-    "team_points_pct",               # team share of total field points
-    "team_recent_form",              # team last 3 races vs season avg
-    "upgrade_trajectory",            # team second half vs first half
-    "teammate_gap_pts",              # points gap to teammate (relative strength)
+    # Championship
+    "points_pct",
+    "points_gap_to_leader",
+    "points_gap_to_p3",
+    "mid_position",
+    "season_stage",
+    # Wins & podiums
+    "composite_win_score",
+    "podium_rate",
+    "points_per_race",
+    "top5_rate",
+    # Rolling form
+    "form_last1",
+    "form_last3",
+    "form_last5",
+    "form_trend",
+    "streak_score",
+    # Qualifying
+    "avg_grid",
+    "qualifying_consistency",
+    "qualifying_ms_advantage",
+    "front_row_rate",
+    # Race execution
+    "avg_positions_gained",
+    "overtaking_rate",
+    "pole_points_rate",
+    "pole_execution_delta",
+    "top_half_grid_points_rate",
+    # FastF1 pace (2022+ only, 0 for earlier years)
+    "pace_vs_field",
+    "sector1_advantage",
+    "sector2_advantage",
+    "sector3_advantage",
+    "pace_consistency",
+    "high_speed_pace",
+    "technical_pace",
+    # Tyre/strategy
+    "tyre_deg_rate",
+    "avg_stint_length",
+    # Reliability
+    "dnf_rate",
+    "mechanical_dnf_rate",
+    "safety_margin_score",
+    # Circuit type
+    "street_circuit_avg_finish",
+    "permanent_circuit_avg_finish",
+    "high_speed_avg_finish",
+    # H2H
+    "h2h_vs_field",
+    "h2h_vs_top3",
+    "teammate_h2h",
+    # Team
+    "team_points_pct",
+    "team_recent_form",
+    "upgrade_trajectory",
+    "teammate_gap_pts",
 ]
 
 
 # ─── DATA FETCHING ────────────────────────────────────────────────────────────
 
-def fetch_json(url, retries=3, delay=0.5):
+def fetch_json(url, retries=3, delay=0.6):
     for attempt in range(retries):
         try:
             time.sleep(delay)
@@ -201,49 +179,57 @@ def fetch_round_standings(year, round_num):
 
 
 def fetch_race_results(year):
-    data = fetch_json(f"https://api.jolpi.ca/ergast/f1/{year}/results.json?limit=500")
-    if not data:
-        return []
-    try:
-        results = []
-        for race in data["MRData"]["RaceTable"]["Races"]:
-            round_num  = int(race["round"])
-            circuit_id = race["Circuit"]["circuitId"]
-            is_street  = 1 if circuit_id in STREET_CIRCUITS else 0
-            is_high    = 1 if circuit_id in HIGH_SPEED_CIRCUITS else 0
-            is_tech    = 1 if circuit_id in TECHNICAL_CIRCUITS else 0
-            is_wet     = 1 if (year, round_num) in WET_RACES else 0
-            for result in race["Results"]:
-                try:
-                    status   = result.get("status", "")
-                    is_dnf   = 1 if any(x in status for x in [
-                        "Retired","Accident","Collision","Mechanical",
-                        "Engine","Gearbox","Hydraulics","Electrical",
-                        "Brakes","Suspension","Tyre"]) else 0
-                    is_mech  = 1 if any(x in status for x in [
-                        "Mechanical","Engine","Gearbox","Hydraulics",
-                        "Electrical","Brakes","Suspension"]) else 0
-                    results.append({
-                        "round":      round_num,
-                        "circuit":    circuit_id,
-                        "is_street":  is_street,
-                        "is_high":    is_high,
-                        "is_tech":    is_tech,
-                        "is_wet":     is_wet,
-                        "driver":     result["Driver"]["code"],
-                        "team":       result["Constructor"]["name"],
-                        "grid":       int(result.get("grid", 0)),
-                        "finish":     int(result["position"]),
-                        "points":     float(result["points"]),
-                        "dnf":        is_dnf,
-                        "mechanical": is_mech,
-                        "laps":       int(result.get("laps", 0)),
-                    })
-                except Exception:
-                    continue
-        return results
-    except Exception:
-        return []
+    results = []
+    offset  = 0
+    while True:
+        data = fetch_json(f"https://api.jolpi.ca/ergast/f1/{year}/results.json?limit=100&offset={offset}")
+        if not data:
+            break
+        races = data["MRData"]["RaceTable"]["Races"]
+        if not races:
+            break
+        total  = int(data["MRData"]["total"])
+        offset += 100
+        try:
+            for race in races:
+                round_num  = int(race["round"])
+                circuit_id = race["Circuit"]["circuitId"]
+                is_street  = 1 if circuit_id in STREET_CIRCUITS    else 0
+                is_high    = 1 if circuit_id in HIGH_SPEED_CIRCUITS else 0
+                is_tech    = 1 if circuit_id in TECHNICAL_CIRCUITS  else 0
+                is_wet     = 1 if (year, round_num) in WET_RACES    else 0
+                for result in race["Results"]:
+                    try:
+                        status  = result.get("status", "")
+                        is_dnf  = 1 if any(x in status for x in [
+                            "Retired","Accident","Collision","Mechanical",
+                            "Engine","Gearbox","Hydraulics","Electrical",
+                            "Brakes","Suspension","Tyre"]) else 0
+                        is_mech = 1 if any(x in status for x in [
+                            "Mechanical","Engine","Gearbox","Hydraulics",
+                            "Electrical","Brakes","Suspension"]) else 0
+                        results.append({
+                            "round":      round_num,
+                            "circuit":    circuit_id,
+                            "is_street":  is_street,
+                            "is_high":    is_high,
+                            "is_tech":    is_tech,
+                            "is_wet":     is_wet,
+                            "driver":     result["Driver"]["code"],
+                            "team":       result["Constructor"]["name"],
+                            "grid":       int(result.get("grid", 0)),
+                            "finish":     int(result["position"]),
+                            "points":     float(result["points"]),
+                            "dnf":        is_dnf,
+                            "mechanical": is_mech,
+                        })
+                    except Exception:
+                        continue
+        except Exception:
+            break
+        if offset >= total:
+            break
+    return results
 
 
 def fetch_constructor_standings(year):
@@ -266,7 +252,7 @@ def fetch_constructor_standings(year):
 
 
 def fetch_fastf1_data(year, round_num):
-    """Race pace + tyre + quali data. 2022+ only."""
+    """Race pace + sector times + quali gap. Called ONCE per year."""
     result = {}
     if year < 2022:
         return result
@@ -275,7 +261,6 @@ def fetch_fastf1_data(year, round_num):
         session = fastf1.get_session(year, round_num, "R")
         session.load(telemetry=False, weather=False, messages=False)
         laps = session.laps.copy()
-
         if not laps.empty:
             laps = laps.dropna(subset=["LapTime","Sector1Time","Sector2Time","Sector3Time"])
             laps["lap_s"] = laps["LapTime"].dt.total_seconds()
@@ -283,24 +268,21 @@ def fetch_fastf1_data(year, round_num):
             laps["s2_s"]  = laps["Sector2Time"].dt.total_seconds()
             laps["s3_s"]  = laps["Sector3Time"].dt.total_seconds()
             laps          = laps[laps["lap_s"] < laps["lap_s"].median() * 1.10]
-            fmd           = laps["lap_s"].median()
-            fs1           = laps["s1_s"].median()
-            fs2           = laps["s2_s"].median()
-            fs3           = laps["s3_s"].median()
-
+            fmd = laps["lap_s"].median()
+            fs1 = laps["s1_s"].median()
+            fs2 = laps["s2_s"].median()
+            fs3 = laps["s3_s"].median()
             for driver, dlaps in laps.groupby("Driver"):
                 if len(dlaps) < 3:
                     continue
                 lap_deltas = fmd - dlaps["lap_s"]
-                deg, stints, pit_positions = [], [], []
-
+                deg, stints = [], []
                 for _, sl in dlaps.sort_values("LapNumber").groupby("Stint"):
                     if len(sl) < 4:
                         continue
                     slope = np.polyfit(np.arange(len(sl)), sl["lap_s"].values, 1)[0]
                     deg.append(slope)
                     stints.append(len(sl))
-
                 result[driver] = {
                     "pace_vs_field":    float(fmd - dlaps["lap_s"].median()),
                     "sector1_adv":      float(fs1 - dlaps["s1_s"].median()),
@@ -319,8 +301,8 @@ def fetch_fastf1_data(year, round_num):
         ql = q_session.laps.copy()
         if not ql.empty:
             ql = ql.dropna(subset=["LapTime"])
-            ql["lap_s"]  = ql["LapTime"].dt.total_seconds()
-            best_q       = ql.groupby("Driver")["lap_s"].min()
+            ql["lap_s"] = ql["LapTime"].dt.total_seconds()
+            best_q = ql.groupby("Driver")["lap_s"].min()
             driver_teams = {}
             try:
                 for d, dl in session.laps.groupby("Driver"):
@@ -340,10 +322,9 @@ def fetch_fastf1_data(year, round_num):
                     tm = [best_q[m] for m in members if m != d and m in best_q.index]
                     if not tm:
                         continue
-                    gap = np.mean(tm) - best_q[d]
                     if d not in result:
                         result[d] = {}
-                    result[d]["quali_ms_adv"] = float(gap)
+                    result[d]["quali_ms_adv"] = float(np.mean(tm) - best_q[d])
     except Exception:
         pass
 
@@ -356,11 +337,12 @@ def build_feature_row(driver, team, pts, pos, snapshot_round, total_rounds,
                        driver_races, all_races, total_pts,
                        leader_pts, p3_pts, constructor_standings,
                        fastf1_data, top3_drivers, teammate_pts):
-    n            = len(driver_races)
+
+    n            = max(len(driver_races), 1)
     max_pts      = snapshot_round * 25 or 1
     total_rounds = max(total_rounds, snapshot_round)
+    season_avg   = pts / n
 
-    # ── Basic stats ───────────────────────────────────────────────────────
     avg_finish   = driver_races["finish"].mean()
     avg_grid     = driver_races["grid"].mean()
     dnf_rate     = driver_races["dnf"].mean()
@@ -368,27 +350,26 @@ def build_feature_row(driver, team, pts, pos, snapshot_round, total_rounds,
     podium_rate  = (driver_races["finish"] <= 3).mean()
     top5_rate    = (driver_races["finish"] <= 5).mean()
     wins         = int((driver_races["finish"] == 1).sum())
-    finish_std   = driver_races["finish"].std() if n > 1 else 5.0
 
     valid_grid   = driver_races[driver_races["grid"] > 0]
     avg_gained   = float((valid_grid["grid"] - valid_grid["finish"]).mean()) if len(valid_grid) > 0 else 0.0
-    grid_std     = float(valid_grid["grid"].std()) if len(valid_grid) > 1 else 5.0
+    grid_std     = float(valid_grid["grid"].std())         if len(valid_grid) > 1 else 5.0
     front_row    = float((valid_grid["grid"] <= 2).mean()) if len(valid_grid) > 0 else 0.0
-    top_half_grid = valid_grid[valid_grid["grid"] <= 10]
-    top_half_pts = float(top_half_grid["points"].mean()) if len(top_half_grid) > 0 else pts / max(n, 1)
+    top_half     = valid_grid[valid_grid["grid"] <= 10]
+    top_half_pts = float(top_half["points"].mean()) if len(top_half) > 0 else season_avg
 
-    composite_win = (wins / snapshot_round) * 0.5 + (wins / n if n > 0 else 0) * 0.5
+    composite_win = (wins / snapshot_round) * 0.5 + (wins / n) * 0.5
 
-    # ── Rolling form windows ──────────────────────────────────────────────
-    season_avg   = pts / n if n > 0 else 0
-    last1        = driver_races.tail(1)["points"].mean() if n >= 1 else season_avg
-    last3        = driver_races.tail(3)["points"].mean() if n >= 3 else season_avg
-    last5        = driver_races.tail(5)["points"].mean() if n >= 5 else season_avg
-    form_last1   = last1 / season_avg if season_avg > 0 else 1.0
-    form_last3   = last3 / season_avg if season_avg > 0 else 1.0
-    form_last5   = last5 / season_avg if season_avg > 0 else 1.0
+    # Rolling form
+    last1      = driver_races.tail(1)["points"].mean() if n >= 1 else season_avg
+    last3      = driver_races.tail(3)["points"].mean() if n >= 3 else season_avg
+    last5      = driver_races.tail(5)["points"].mean() if n >= 5 else season_avg
+    form_last1 = last1 / season_avg if season_avg > 0 else 1.0
+    form_last3 = last3 / season_avg if season_avg > 0 else 1.0
+    form_last5 = last5 / season_avg if season_avg > 0 else 1.0
+    pts_arr    = driver_races.sort_values("round")["points"].values
+    form_trend = float(np.polyfit(np.arange(len(pts_arr)), pts_arr, 1)[0]) if n >= 3 else 0.0
 
-    # Streak: consecutive races scoring points
     streak = 0
     for _, row in driver_races.sort_values("round", ascending=False).iterrows():
         if row["points"] > 0:
@@ -396,95 +377,82 @@ def build_feature_row(driver, team, pts, pos, snapshot_round, total_rounds,
         else:
             break
 
-    # Form trend (slope over all races)
-    pts_arr      = driver_races.sort_values("round")["points"].values
-    form_trend   = float(np.polyfit(np.arange(len(pts_arr)), pts_arr, 1)[0]) if n >= 3 else 0.0
-
-    # ── Qualifying ────────────────────────────────────────────────────────
+    # Qualifying & pole execution
     pole_races   = driver_races[driver_races["grid"] == 1]
     non_pole     = driver_races[driver_races["grid"] > 1]
-    pole_pts     = float(pole_races["points"].mean())  if len(pole_races) > 0 else season_avg
-    non_pole_pts = float(non_pole["points"].mean())    if len(non_pole)   > 0 else season_avg
-    pole_delta   = pole_pts - non_pole_pts
+    pole_pts_r   = float(pole_races["points"].mean()) if len(pole_races) > 0 else season_avg
+    non_pole_pts = float(non_pole["points"].mean())   if len(non_pole)   > 0 else season_avg
+    pole_delta   = pole_pts_r - non_pole_pts
 
-    # ── Overtaking ────────────────────────────────────────────────────────
-    back_starts  = driver_races[driver_races["grid"] >= 6]
-    overtaking   = float((back_starts["grid"] - back_starts["finish"]).mean()) if len(back_starts) > 0 else avg_gained
+    back_starts = driver_races[driver_races["grid"] >= 6]
+    overtaking  = float((back_starts["grid"] - back_starts["finish"]).mean()) if len(back_starts) > 0 else avg_gained
 
-    # ── Circuit type performance ──────────────────────────────────────────
-    street_r     = driver_races[driver_races["is_street"] == 1]
-    perm_r       = driver_races[driver_races["is_street"] == 0]
-    high_r       = driver_races[driver_races["is_high"]   == 1]
-    tech_r       = driver_races[driver_races["is_tech"]   == 1]
-    street_avg   = float(street_r["finish"].mean()) if len(street_r) > 0 else avg_finish
-    perm_avg     = float(perm_r["finish"].mean())   if len(perm_r)  > 0 else avg_finish
-    high_avg     = float(high_r["finish"].mean())   if len(high_r)  > 0 else avg_finish
+    # Circuit type splits
+    street_r = driver_races[driver_races["is_street"] == 1]
+    perm_r   = driver_races[driver_races["is_street"] == 0]
+    high_r   = driver_races[driver_races["is_high"]   == 1]
+    tech_r   = driver_races[driver_races["is_tech"]   == 1]
+    street_avg = float(street_r["finish"].mean()) if len(street_r) > 0 else avg_finish
+    perm_avg   = float(perm_r["finish"].mean())   if len(perm_r)  > 0 else avg_finish
+    high_avg   = float(high_r["finish"].mean())   if len(high_r)  > 0 else avg_finish
 
-    # ── H2H stats ─────────────────────────────────────────────────────────
-    h2h_wins_field, h2h_total_field = 0, 0
-    h2h_wins_top3,  h2h_total_top3  = 0, 0
-    h2h_wins_tm,    h2h_total_tm    = 0, 0
-
+    # H2H
+    h2h_wf, h2h_tf = 0, 0
+    h2h_w3, h2h_t3 = 0, 0
+    h2h_wt, h2h_tt = 0, 0
     for _, rrow in driver_races.iterrows():
         rnd    = rrow["round"]
         my_pos = rrow["finish"]
         others = all_races[(all_races["round"] == rnd) & (all_races["driver"] != driver)]
         for _, orow in others.iterrows():
-            h2h_total_field += 1
+            h2h_tf += 1
             if my_pos < orow["finish"]:
-                h2h_wins_field += 1
+                h2h_wf += 1
             if orow["driver"] in top3_drivers:
-                h2h_total_top3 += 1
+                h2h_t3 += 1
                 if my_pos < orow["finish"]:
-                    h2h_wins_top3 += 1
+                    h2h_w3 += 1
             if orow["team"] == team:
-                h2h_total_tm += 1
+                h2h_tt += 1
                 if my_pos < orow["finish"]:
-                    h2h_wins_tm += 1
+                    h2h_wt += 1
 
-    h2h_field = h2h_wins_field / h2h_total_field if h2h_total_field > 0 else 0.5
-    h2h_top3  = h2h_wins_top3  / h2h_total_top3  if h2h_total_top3  > 0 else 0.5
-    h2h_tm    = h2h_wins_tm    / h2h_total_tm     if h2h_total_tm    > 0 else 0.5
+    h2h_field = h2h_wf / h2h_tf if h2h_tf > 0 else 0.5
+    h2h_top3  = h2h_w3 / h2h_t3 if h2h_t3 > 0 else 0.5
+    h2h_tm    = h2h_wt / h2h_tt if h2h_tt > 0 else 0.5
 
-    # ── Team factors ──────────────────────────────────────────────────────
+    # Team factors
     team_races   = all_races[all_races["team"] == team]
     half         = max(1, snapshot_round // 2)
     t_first      = team_races[team_races["round"] <= half]["points"].mean() if len(team_races) > 0 else 0
-    t_second_r   = team_races[team_races["round"] > half]
-    t_second     = t_second_r["points"].mean() if len(t_second_r) > 0 else t_first
+    t_sec_r      = team_races[team_races["round"] > half]
+    t_second     = t_sec_r["points"].mean() if len(t_sec_r) > 0 else t_first
     upgrade_traj = float(t_second - t_first)
-
     team_recent  = team_races.tail(6)
     team_avg     = float(team_races["points"].mean())  if len(team_races)  > 0 else 0
     team_rec     = float(team_recent["points"].mean()) if len(team_recent) > 0 else team_avg
     team_form    = team_rec / team_avg if team_avg > 0 else 1.0
-
     cons_info    = constructor_standings.get(team, {})
     cons_pts     = cons_info.get("points", 0)
     team_pts_pct = cons_pts / total_pts if total_pts > 0 else 0
-
     teammate_gap = (pts - teammate_pts) / max(pts, 1) if teammate_pts is not None else 0.0
 
-    # ── FastF1 ────────────────────────────────────────────────────────────
-    f1           = fastf1_data.get(driver, {})
-    quali_ms     = f1.get("quali_ms_adv", 0.0)
+    finishing  = driver_races[driver_races["dnf"] == 0]
+    safety_mg  = float((20 - finishing["finish"]).mean()) if len(finishing) > 0 else 0.0
 
-    # ── Season stage ──────────────────────────────────────────────────────
-    season_stage = snapshot_round / total_rounds
-
-    # ── Safety margin ─────────────────────────────────────────────────────
-    finishing_races = driver_races[driver_races["dnf"] == 0]
-    safety_margin   = float((20 - finishing_races["finish"]).mean()) if len(finishing_races) > 0 else 0.0
+    f1        = fastf1_data.get(driver, {})
+    hs_pace   = f1.get("pace_vs_field", 0.0) if len(high_r) > 0 else 0.0
+    tech_pace = f1.get("pace_vs_field", 0.0) if len(tech_r) > 0 else 0.0
 
     return {
         "points_pct":                   pts / max_pts,
         "points_gap_to_leader":         (leader_pts - pts) / leader_pts if leader_pts > 0 else 0,
         "points_gap_to_p3":             (p3_pts - pts) / p3_pts if p3_pts > 0 else 0,
         "mid_position":                 pos,
-        "season_stage":                 season_stage,
+        "season_stage":                 snapshot_round / total_rounds,
         "composite_win_score":          composite_win,
         "podium_rate":                  podium_rate,
-        "points_per_race":              pts / n if n > 0 else 0,
+        "points_per_race":              season_avg,
         "top5_rate":                    top5_rate,
         "form_last1":                   form_last1,
         "form_last3":                   form_last3,
@@ -493,11 +461,11 @@ def build_feature_row(driver, team, pts, pos, snapshot_round, total_rounds,
         "streak_score":                 float(streak),
         "avg_grid":                     avg_grid,
         "qualifying_consistency":       grid_std,
-        "qualifying_ms_advantage":      quali_ms,
+        "qualifying_ms_advantage":      f1.get("quali_ms_adv", 0.0),
         "front_row_rate":               front_row,
         "avg_positions_gained":         avg_gained,
         "overtaking_rate":              overtaking,
-        "pole_points_rate":             pole_pts,
+        "pole_points_rate":             pole_pts_r,
         "pole_execution_delta":         pole_delta,
         "top_half_grid_points_rate":    top_half_pts,
         "pace_vs_field":                f1.get("pace_vs_field", 0.0),
@@ -505,15 +473,13 @@ def build_feature_row(driver, team, pts, pos, snapshot_round, total_rounds,
         "sector2_advantage":            f1.get("sector2_adv", 0.0),
         "sector3_advantage":            f1.get("sector3_adv", 0.0),
         "pace_consistency":             f1.get("pace_consistency", 0.0),
-        "high_speed_pace":              f1.get("pace_vs_field", 0.0) if len(high_r) > 0 else 0.0,
-        "technical_pace":               f1.get("pace_vs_field", 0.0) if len(tech_r) > 0 else 0.0,
+        "high_speed_pace":              hs_pace,
+        "technical_pace":               tech_pace,
         "tyre_deg_rate":                f1.get("tyre_deg_rate", 0.0),
         "avg_stint_length":             f1.get("avg_stint_length", 20.0),
-        "undercut_success_rate":        0.0,  # placeholder for future pit data
-        "overcut_success_rate":         0.0,
         "dnf_rate":                     dnf_rate,
         "mechanical_dnf_rate":          mech_rate,
-        "safety_margin_score":          safety_margin,
+        "safety_margin_score":          safety_mg,
         "street_circuit_avg_finish":    street_avg,
         "permanent_circuit_avg_finish": perm_avg,
         "high_speed_avg_finish":        high_avg,
@@ -539,16 +505,15 @@ def validate_at_split(df, split_pct, feature_cols, params=None):
     sc       = StandardScaler()
     Xtr      = sc.fit_transform(train_df[feature_cols].fillna(0))
     Xte      = sc.transform(test_df[feature_cols].fillna(0))
-
+    base = {
+        "n_estimators": 300, "learning_rate": 0.04, "max_depth": 4,
+        "subsample": 0.75, "colsample_bytree": 0.7, "colsample_bylevel": 0.7,
+        "min_child_weight": 5, "reg_alpha": 0.5, "reg_lambda": 2.0,
+    }
     if params:
-        m = xgb.XGBRegressor(**{k: v for k, v in params.items() if k not in ("random_state", "verbosity")}, random_state=42, verbosity=0)
-    else:
-        m = xgb.XGBRegressor(
-            n_estimators=300, learning_rate=0.04, max_depth=4,
-            subsample=0.75, colsample_bytree=0.7, colsample_bylevel=0.7,
-            min_child_weight=5, reg_alpha=0.5, reg_lambda=2.0,
-            random_state=42, verbosity=0
-        )
+        clean = {k: v for k, v in params.items() if k not in ("random_state","verbosity")}
+        base.update(clean)
+    m = xgb.XGBRegressor(**base, random_state=42, verbosity=0)
     m.fit(Xtr, train_df["final_points"], sample_weight=train_df["season_weight"], verbose=False)
     return round(mean_absolute_error(test_df["final_points"], m.predict(Xte)), 2)
 
@@ -556,8 +521,6 @@ def validate_at_split(df, split_pct, feature_cols, params=None):
 # ─── DATA COLLECTION ──────────────────────────────────────────────────────────
 
 def collect_training_data(use_cache=True):
-    """Collect training data sampling every round per season."""
-
     if use_cache and os.path.exists(DATA_CACHE):
         print("📦 Loading cached training data...")
         df = pd.read_pickle(DATA_CACHE)
@@ -581,53 +544,48 @@ def collect_training_data(use_cache=True):
         total_rounds = int(race_df["round"].max())
         final_pts    = {s["Driver"]["code"]: float(s["points"]) for s in final}
 
-        # FastF1 data for each round (2022+ only)
-        f1_by_round = {}
+        # FastF1 fetched ONCE per year at final round — applied to all snapshots
+        f1_data = {}
         if year >= 2022:
-            print(f"(FastF1 per round...)", end=" ", flush=True)
-            for rnd in range(MIN_ROUNDS_FOR_SNAPSHOT, total_rounds + 1):
-                f1_by_round[rnd] = fetch_fastf1_data(year, rnd)
+            print(f"(FastF1...)", end=" ", flush=True)
+            f1_data = fetch_fastf1_data(year, total_rounds)
 
-        # Sample EVERY round from MIN_ROUNDS onwards
-        snapshots = list(range(MIN_ROUNDS_FOR_SNAPSHOT, total_rounds + 1))
+        # Build driver->team map from race results (no extra API calls)
+        driver_team_map = {}
+        for _, row in race_df.iterrows():
+            driver_team_map[row["driver"]] = row["team"]
+
         year_rows = 0
-
-        for snap in snapshots:
-            mid = fetch_round_standings(year, snap)
-            if not mid:
+        for snap in range(MIN_ROUNDS_FOR_SNAPSHOT, total_rounds + 1):
+            snap_races = race_df[race_df["round"] <= snap]
+            if snap_races.empty:
                 continue
 
-            snap_races  = race_df[race_df["round"] <= snap]
-            total_pts_f = sum(float(s["points"]) for s in mid)
-            leader_pts  = float(mid[0]["points"]) if mid else 1
-            p3_pts      = float(mid[2]["points"]) if len(mid) >= 3 else leader_pts
-            top3        = [s["Driver"]["code"] for s in mid[:3]]
-            f1_data     = f1_by_round.get(snap, {})
+            # Compute standings locally — zero API calls per round
+            pts_by_driver  = snap_races.groupby("driver")["points"].sum().to_dict()
+            if not pts_by_driver:
+                continue
+            sorted_drivers = sorted(pts_by_driver.items(), key=lambda x: -x[1])
+            total_pts_f    = sum(pts_by_driver.values()) or 1
+            leader_pts     = sorted_drivers[0][1] if sorted_drivers else 1
+            p3_pts         = sorted_drivers[2][1] if len(sorted_drivers) >= 3 else leader_pts
+            top3           = [d for d, _ in sorted_drivers[:3]]
 
-            # Build teammate points map
-            teammate_pts_map = {}
-            for s in mid:
-                d    = s["Driver"]["code"]
-                team = s["Constructors"][0]["name"] if "Constructors" in s else "Unknown"
-                p    = float(s["points"])
-                if team not in teammate_pts_map:
-                    teammate_pts_map[team] = []
-                teammate_pts_map[team].append((d, p))
+            tm_map = {}
+            for driver, pts in sorted_drivers:
+                team = driver_team_map.get(driver, "Unknown")
+                tm_map.setdefault(team, []).append((driver, pts))
 
-            for s in mid:
+            for pos_idx, (driver, pts) in enumerate(sorted_drivers):
                 try:
-                    driver = s["Driver"]["code"]
-                    team   = s["Constructors"][0]["name"] if "Constructors" in s else "Unknown"
-                    pts    = float(s["points"])
-                    pos    = int(s["position"])
-                    dr     = snap_races[snap_races["driver"] == driver]
+                    pos  = pos_idx + 1
+                    team = driver_team_map.get(driver, "Unknown")
+                    dr   = snap_races[snap_races["driver"] == driver]
                     if len(dr) < 1:
                         continue
 
-                    # Teammate pts for comparison
-                    tm_entries = teammate_pts_map.get(team, [])
-                    tm_pts     = [p for d, p in tm_entries if d != driver]
-                    tm_avg     = np.mean(tm_pts) if tm_pts else pts
+                    tm_pts_list = [p for d, p in tm_map.get(team, []) if d != driver]
+                    tm_avg      = float(np.mean(tm_pts_list)) if tm_pts_list else pts
 
                     feats = build_feature_row(
                         driver, team, pts, pos, snap, total_rounds,
@@ -651,23 +609,20 @@ def collect_training_data(use_cache=True):
         print(f"✅ {year_rows} samples ({total_rounds} rounds)")
 
     df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
-
     if not df.empty:
         df.to_pickle(DATA_CACHE)
-        print(f"\n💾 Training data cached to {DATA_CACHE}")
-
+        print(f"\n💾 Cached to {DATA_CACHE}")
     return df
 
 
-# ─── OPTUNA HYPERPARAMETER TUNING ─────────────────────────────────────────────
+# ─── OPTUNA TUNING ────────────────────────────────────────────────────────────
 
 def tune_hyperparameters(df, feature_cols, n_trials=50):
-    """Use Optuna to find best XGBoost hyperparameters."""
     try:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     except ImportError:
-        print("⚠️  Optuna not installed. Run: pip install optuna --break-system-packages")
+        print("⚠️  Run: pip install optuna --break-system-packages")
         return None
 
     X  = df[feature_cols].fillna(0)
@@ -687,17 +642,17 @@ def tune_hyperparameters(df, feature_cols, n_trials=50):
             "reg_alpha":         trial.suggest_float("reg_alpha", 0.01, 2.0, log=True),
             "reg_lambda":        trial.suggest_float("reg_lambda", 0.5, 5.0, log=True),
         }
-        sc    = StandardScaler()
-        maes  = []
-        for tr_idx, te_idx in kf.split(X):
-            Xtr = sc.fit_transform(X.iloc[tr_idx])
-            Xte = sc.transform(X.iloc[te_idx])
+        maes = []
+        sc   = StandardScaler()
+        for tr, te in kf.split(X):
+            Xtr = sc.fit_transform(X.iloc[tr])
+            Xte = sc.transform(X.iloc[te])
             m   = xgb.XGBRegressor(**params, random_state=42, verbosity=0)
-            m.fit(Xtr, y.iloc[tr_idx], sample_weight=w.iloc[tr_idx], verbose=False)
-            maes.append(mean_absolute_error(y.iloc[te_idx], m.predict(Xte)))
-        return np.mean(maes)
+            m.fit(Xtr, y.iloc[tr], sample_weight=w.iloc[tr], verbose=False)
+            maes.append(mean_absolute_error(y.iloc[te], m.predict(Xte)))
+        return float(np.mean(maes))
 
-    print(f"\n🔬 Running Optuna ({n_trials} trials)...")
+    print(f"\n🔬 Optuna tuning ({n_trials} trials)...")
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     print(f"   Best CV MAE: {study.best_value:.2f} pts")
@@ -705,27 +660,28 @@ def tune_hyperparameters(df, feature_cols, n_trials=50):
     return study.best_params
 
 
-# ─── ENSEMBLE MODEL ───────────────────────────────────────────────────────────
+# ─── ENSEMBLE ─────────────────────────────────────────────────────────────────
 
 class F1Ensemble:
-    """Weighted ensemble of XGBoost + LightGBM + GradientBoosting."""
-
     def __init__(self, xgb_params=None):
-        self.xgb_params = xgb_params or {
+        self.xgb_params = xgb_params or {}
+        self.models  = []
+        self.weights = [0.50, 0.30, 0.20]
+
+    def _clean(self, params):
+        return {k: v for k, v in params.items() if k not in ("random_state","verbosity")}
+
+    def fit(self, X, y, sample_weight=None):
+        base = {
             "n_estimators": 500, "learning_rate": 0.03, "max_depth": 4,
             "subsample": 0.75, "colsample_bytree": 0.7, "colsample_bylevel": 0.7,
             "min_child_weight": 5, "reg_alpha": 0.5, "reg_lambda": 2.0,
-            "random_state": 42, "verbosity": 0
         }
-        self.models  = []
-        self.weights = []
+        base.update(self._clean(self.xgb_params))
 
-    def fit(self, X, y, sample_weight=None):
-        # XGBoost
-        m_xgb = xgb.XGBRegressor(**self.xgb_params)
+        m_xgb = xgb.XGBRegressor(**base, random_state=42, verbosity=0)
         m_xgb.fit(X, y, sample_weight=sample_weight, verbose=False)
 
-        # LightGBM
         m_lgb = lgb.LGBMRegressor(
             n_estimators=500, learning_rate=0.03, max_depth=4,
             subsample=0.75, colsample_bytree=0.7,
@@ -734,30 +690,26 @@ class F1Ensemble:
         )
         m_lgb.fit(X, y, sample_weight=sample_weight)
 
-        # Gradient Boosting
         m_gb = GradientBoostingRegressor(
             n_estimators=300, learning_rate=0.04, max_depth=4,
-            subsample=0.75, min_samples_leaf=5,
-            random_state=42
+            subsample=0.75, min_samples_leaf=5, random_state=42
         )
         m_gb.fit(X, y, sample_weight=sample_weight)
 
-        self.models  = [m_xgb, m_lgb, m_gb]
-        self.weights = [0.50, 0.30, 0.20]  # XGBoost weighted highest
+        self.models = [m_xgb, m_lgb, m_gb]
         return self
 
     def predict(self, X):
         preds = np.array([m.predict(X) for m in self.models])
         return np.average(preds, axis=0, weights=self.weights)
 
-    def feature_importances_(self, feature_cols):
-        """Average feature importances across XGBoost and LightGBM."""
+    def get_feature_importances(self, feature_cols):
         xgb_imp = pd.Series(self.models[0].feature_importances_, index=feature_cols)
         lgb_imp = pd.Series(self.models[1].feature_importances_, index=feature_cols)
         return ((xgb_imp + lgb_imp) / 2).sort_values(ascending=False)
 
 
-# ─── MAIN TRAINING ────────────────────────────────────────────────────────────
+# ─── TRAINING ─────────────────────────────────────────────────────────────────
 
 def train_and_save(df, xgb_params=None):
     feature_cols = [f for f in ALL_FEATURES if f in df.columns]
@@ -771,28 +723,31 @@ def train_and_save(df, xgb_params=None):
     test_mask  = df["year"] == 2025
     has_test   = test_mask.sum() > 0
 
-    sc      = StandardScaler()
-    X_tr    = sc.fit_transform(X[train_mask])
-    X_te    = sc.transform(X[test_mask]) if has_test else X_tr[:1]
-    y_tr    = y[train_mask]
-    y_te    = y[test_mask] if has_test else y[:1]
-    w_tr    = w[train_mask]
+    sc   = StandardScaler()
+    X_tr = sc.fit_transform(X[train_mask])
+    X_te = sc.transform(X[test_mask]) if has_test else X_tr[:1]
+    y_tr = y[train_mask]
+    y_te = y[test_mask] if has_test else y[:1]
+    w_tr = w[train_mask]
 
-    # ── Round 1: XGBoost for feature importance ───────────────────────────
-    print("\n🔄 Round 1 — Feature importance pass...")
-    params_r1 = xgb_params or {
+    base_params = {
         "n_estimators": 400, "learning_rate": 0.04, "max_depth": 4,
         "subsample": 0.75, "colsample_bytree": 0.7, "colsample_bylevel": 0.7,
         "min_child_weight": 5, "reg_alpha": 0.5, "reg_lambda": 2.0,
-        "random_state": 42, "verbosity": 0
     }
-    m1 = xgb.XGBRegressor(**params_r1)
+    if xgb_params:
+        clean = {k: v for k, v in xgb_params.items() if k not in ("random_state","verbosity")}
+        base_params.update(clean)
+
+    # Round 1 — feature importance
+    print("\n🔄 Round 1 — Feature importance pass...")
+    m1 = xgb.XGBRegressor(**base_params, random_state=42, verbosity=0)
     m1.fit(X_tr, y_tr, sample_weight=w_tr, verbose=False)
     mae1 = mean_absolute_error(y_te, m1.predict(X_te)) if has_test else 999
-    print(f"   Time MAE (XGBoost only): {mae1:.2f} pts")
+    print(f"   Time MAE (XGBoost): {mae1:.2f} pts")
 
     imp = pd.Series(m1.feature_importances_, index=feature_cols).sort_values(ascending=False)
-    print(f"\n📈 Feature Importance (threshold = {IMPORTANCE_THRESHOLD}):")
+    print(f"\n📈 Feature Importance (threshold={IMPORTANCE_THRESHOLD}):")
     for feat, score in imp.items():
         bar    = "█" * max(1, int(score * 400))
         status = "✅" if score >= IMPORTANCE_THRESHOLD else "❌"
@@ -802,28 +757,30 @@ def train_and_save(df, xgb_params=None):
     dropped       = [f for f in feature_cols if f not in good_features]
     print(f"\n✂️  Keeping {len(good_features)}, dropping {len(dropped)}: {dropped}")
 
-    # ── Round 2: Ensemble on pruned features ──────────────────────────────
-    print(f"\n🔄 Round 2 — Ensemble model ({len(good_features)} features)...")
+    # Round 2 — Ensemble on pruned features
+    print(f"\n🔄 Round 2 — Ensemble ({len(good_features)} features)...")
     X2   = df[good_features].fillna(0)
     sc2  = StandardScaler()
     X2tr = sc2.fit_transform(X2[train_mask])
     X2te = sc2.transform(X2[test_mask]) if has_test else X2tr[:1]
 
-    ensemble = F1Ensemble(xgb_params=params_r1)
+    ensemble = F1Ensemble(xgb_params=base_params)
     ensemble.fit(X2tr, y_tr.values, sample_weight=w_tr.values)
     mae2 = mean_absolute_error(y_te, ensemble.predict(X2te)) if has_test else 999
     print(f"   Time MAE (Ensemble): {mae2:.2f} pts")
 
     if mae2 <= mae1:
         print("   ✅ Ensemble wins!")
-        use_ensemble = True
+        use_ensemble     = True
         ff, fs, best_mae = good_features, sc2, mae2
+        save_model       = ensemble
     else:
-        print("   ↩️  Single XGBoost wins")
-        use_ensemble = False
+        print("   ↩️  XGBoost wins")
+        use_ensemble     = False
         ff, fs, best_mae = feature_cols, sc, mae1
+        save_model       = m1
 
-    # ── Dynamic multi-split validation ────────────────────────────────────
+    # Dynamic multi-split validation
     print("\n🔁 Dynamic Multi-Split Validation")
     print(f"   {'Train':>8}  →  {'Predict':>8}    MAE")
     print("   " + "─" * 44)
@@ -831,7 +788,7 @@ def train_and_save(df, xgb_params=None):
     df_s       = df.sort_values(["year","snapshot_round"]).reset_index(drop=True)
     split_maes = {}
     for split in splits:
-        mae = validate_at_split(df_s, split, ff, params_r1)
+        mae = validate_at_split(df_s, split, ff, base_params)
         if mae is not None:
             tp  = round(split * 100)
             pp  = 100 - tp
@@ -839,8 +796,8 @@ def train_and_save(df, xgb_params=None):
             print(f"   {tp:>7}%  →  {pp:>7}%    {bar:<22}  {mae:.2f} pts")
             split_maes[str(split)] = mae
 
-    # ── 5-Fold CV ─────────────────────────────────────────────────────────
-    print("\n🔁 5-Fold Cross Validation (Ensemble)...")
+    # 5-fold CV
+    print("\n🔁 5-Fold Cross Validation...")
     kf      = KFold(n_splits=5, shuffle=True, random_state=42)
     X_final = df[ff].fillna(0)
     cv_maes = []
@@ -848,9 +805,14 @@ def train_and_save(df, xgb_params=None):
         sc_cv = StandardScaler()
         Xtr2  = sc_cv.fit_transform(X_final.iloc[tri])
         Xte2  = sc_cv.transform(X_final.iloc[tei])
-        ens   = F1Ensemble(xgb_params=params_r1)
-        ens.fit(Xtr2, y.iloc[tri].values, sample_weight=w.iloc[tri].values)
-        fold_mae = mean_absolute_error(y.iloc[tei], ens.predict(Xte2))
+        if use_ensemble:
+            ens = F1Ensemble(xgb_params=base_params)
+            ens.fit(Xtr2, y.iloc[tri].values, sample_weight=w.iloc[tri].values)
+            fold_mae = mean_absolute_error(y.iloc[tei], ens.predict(Xte2))
+        else:
+            m = xgb.XGBRegressor(**base_params, random_state=42, verbosity=0)
+            m.fit(Xtr2, y.iloc[tri], sample_weight=w.iloc[tri], verbose=False)
+            fold_mae = mean_absolute_error(y.iloc[tei], m.predict(Xte2))
         cv_maes.append(fold_mae)
         print(f"   Fold {fold_i+1}: {fold_mae:.2f} pts")
 
@@ -858,25 +820,19 @@ def train_and_save(df, xgb_params=None):
     cv_std  = float(np.std(cv_maes))
     print(f"   Average: {cv_mean:.2f} ± {cv_std:.2f} pts")
 
-    # ── Final fit on ALL data ─────────────────────────────────────────────
-    print("\n💾 Fitting final model on all data and saving...")
-    X_all    = fs.fit_transform(X_final)
-
+    # Final fit and save
+    print("\n💾 Fitting on all data and saving...")
+    X_all = fs.fit_transform(X_final)
     if use_ensemble:
-        final_model = ensemble
-        final_model.fit(X_all, y.values, sample_weight=w.values)
+        save_model.fit(X_all, y.values, sample_weight=w.values)
     else:
-        final_model = m1
-        final_model.fit(X_all, y, sample_weight=w, verbose=False)
+        save_model.fit(X_all, y, sample_weight=w, verbose=False)
 
-    joblib.dump(final_model, MODEL_PATH)
-    joblib.dump(fs,          SCALER_PATH)
+    joblib.dump(save_model, MODEL_PATH)
+    joblib.dump(fs,         SCALER_PATH)
 
-    # Final feature importance
-    if use_ensemble:
-        imp2 = ensemble.feature_importances_(ff)
-    else:
-        imp2 = pd.Series(final_model.feature_importances_, index=ff).sort_values(ascending=False)
+    imp2 = save_model.get_feature_importances(ff) if use_ensemble else \
+           pd.Series(save_model.feature_importances_, index=ff).sort_values(ascending=False)
 
     meta = {
         "features":           ff,
@@ -894,12 +850,12 @@ def train_and_save(df, xgb_params=None):
         json.dump(meta, f, indent=2)
 
     print(f"\n✅ Saved!")
-    print(f"   Model:     {'Ensemble (XGB+LGB+GB)' if use_ensemble else 'XGBoost'}")
-    print(f"   Features:  {len(ff)}")
-    print(f"   Samples:   {len(df)}")
-    print(f"   Time MAE:  {best_mae:.2f} pts  (unseen 2025 data)")
-    print(f"   CV MAE:    {cv_mean:.2f} ± {cv_std:.2f} pts")
-    return final_model, fs, meta
+    print(f"   Model:    {'Ensemble (XGB+LGB+GB)' if use_ensemble else 'XGBoost'}")
+    print(f"   Features: {len(ff)}")
+    print(f"   Samples:  {len(df)}")
+    print(f"   Time MAE: {best_mae:.2f} pts  (unseen 2025 data)")
+    print(f"   CV MAE:   {cv_mean:.2f} ± {cv_std:.2f} pts")
+    return save_model, fs, meta
 
 
 # ─── LOAD ─────────────────────────────────────────────────────────────────────
@@ -928,15 +884,15 @@ def predict_championship(current_standings, race_results, constructor_standings,
     p3_pts     = float(current_standings[2]["points"]) if len(current_standings) >= 3 else leader_pts
     f1_data    = fastf1_data or {}
     top3       = [s["Driver"]["code"] for s in current_standings[:3]]
-
-    teammate_pts_map = {}
+    tm_map     = {}
     for s in current_standings:
         d    = s["Driver"]["code"]
         team = s["Constructors"][0]["name"] if "Constructors" in s else "Unknown"
-        p    = float(s["points"])
-        teammate_pts_map.setdefault(team, []).append((d, p))
+        tm_map.setdefault(team, []).append((d, float(s["points"])))
 
+    total_rounds = int(races["round"].max()) if not races.empty else round_num
     rows = []
+
     for s in current_standings:
         try:
             driver = s["Driver"]["code"]
@@ -948,13 +904,8 @@ def predict_championship(current_standings, race_results, constructor_standings,
             dr = races[races["driver"] == driver]
             if len(dr) == 0:
                 continue
-
-            tm_entries = teammate_pts_map.get(team, [])
-            tm_pts     = [p for d, p in tm_entries if d != driver]
-            tm_avg     = np.mean(tm_pts) if tm_pts else pts
-
-            total_rounds = int(races["round"].max()) if not races.empty else round_num
-
+            tm_pts_list = [p for d, p in tm_map.get(team, []) if d != driver]
+            tm_avg      = float(np.mean(tm_pts_list)) if tm_pts_list else pts
             feats  = build_feature_row(
                 driver, team, pts, pos, round_num, total_rounds,
                 dr, races, total_pts, leader_pts, p3_pts,
@@ -962,7 +913,6 @@ def predict_championship(current_standings, race_results, constructor_standings,
             )
             row_df = pd.DataFrame([{f: feats.get(f, 0) for f in features}])
             pred   = float(model.predict(scaler.transform(row_df.fillna(0)))[0])
-
             rows.append({
                 "driver":           driver,
                 "team":             team,
@@ -986,11 +936,11 @@ def predict_championship(current_standings, race_results, constructor_standings,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--retrain",    action="store_true", help="Force retrain")
-    parser.add_argument("--evaluate",   action="store_true", help="Full report")
-    parser.add_argument("--tune",       action="store_true", help="Run Optuna tuning")
-    parser.add_argument("--no-cache",   action="store_true", help="Ignore data cache")
-    parser.add_argument("--trials",     type=int, default=50, help="Optuna trials (default 50)")
+    parser.add_argument("--retrain",  action="store_true")
+    parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--tune",     action="store_true")
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--trials",   type=int, default=50)
     args = parser.parse_args()
 
     if not args.retrain and not args.tune:
@@ -999,14 +949,14 @@ if __name__ == "__main__":
             if args.evaluate and meta:
                 print("\n📊 Full Model Report — v4")
                 print("=" * 60)
-                print(f"Trained:   {meta['trained_at']}")
-                print(f"Samples:   {meta['samples']}")
-                print(f"Model:     {'Ensemble' if meta.get('ensemble') else 'XGBoost'}")
-                print(f"Time MAE:  {meta['mae']} pts  (unseen 2025 data)")
-                print(f"CV MAE:    {meta['cv_mae']} ± {meta['cv_std']} pts")
+                print(f"Trained:  {meta['trained_at']}")
+                print(f"Samples:  {meta['samples']}")
+                print(f"Model:    {'Ensemble' if meta.get('ensemble') else 'XGBoost'}")
+                print(f"Time MAE: {meta['mae']} pts  (unseen 2025 data)")
+                print(f"CV MAE:   {meta['cv_mae']} ± {meta['cv_std']} pts")
                 print(f"\n🔁 Dynamic Split Results:")
                 for split, mae in meta.get("split_validation", {}).items():
-                    tp = round(float(split) * 100)
+                    tp  = round(float(split) * 100)
                     bar = "█" * max(1, int(mae / 3))
                     print(f"   Train {tp:>3}% → Predict {100-tp:>3}%:  {bar:<22}  {mae} pts")
                 print(f"\n📈 Feature Importance:")
@@ -1020,11 +970,9 @@ if __name__ == "__main__":
     print("🏎️  F1 Prediction Model v4 — Maximum Depth")
     print("=" * 60)
     print(f"Years: {TRAIN_YEARS[0]}–{TRAIN_YEARS[-1]}")
-    print(f"Sampling every round (max training data)")
-    print(f"Ensemble: XGBoost + LightGBM + GradientBoosting")
-    print(f"2022+ ground effect era weighted highest\n")
+    print(f"Every round sampled | FastF1 once/year | Ensemble\n")
 
-    use_cache = not args.no_cache
+    use_cache = not getattr(args, "no_cache", False)
     df = collect_training_data(use_cache=use_cache)
 
     if df.empty:
@@ -1032,7 +980,6 @@ if __name__ == "__main__":
         import sys; sys.exit(1)
 
     print(f"\n✅ {len(df)} total training samples")
-
     feature_cols = [f for f in ALL_FEATURES if f in df.columns]
 
     xgb_params = None
