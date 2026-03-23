@@ -46,6 +46,7 @@ META_PATH   = os.path.join(BASE_DIR, "f1_model_meta.json")
 CACHE_DIR   = os.path.join(BASE_DIR, "f1_cache")
 DATA_CACHE  = os.path.join(BASE_DIR, "training_data_cache.pkl")
 
+os.makedirs(CACHE_DIR, exist_ok=True)
 fastf1.Cache.enable_cache(CACHE_DIR)
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
