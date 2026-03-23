@@ -927,9 +927,12 @@ def predict_championship(current_standings, race_results, constructor_standings,
     if not rows:
         return []
     rows.sort(key=lambda x: x["predicted_points"], reverse=True)
-    max_pred = rows[0]["predicted_points"] or 1
-    for r in rows:
-        r["win_probability"] = round((r["predicted_points"] / max_pred) * 60, 1)
+    preds   = [r["predicted_points"] for r in rows]
+    min_p   = min(preds) if preds else 0
+    shifted = [max(0.0, p - min_p) for p in preds]
+    total   = sum(shifted) or 1
+    for i, r in enumerate(rows):
+        r["win_probability"] = round((shifted[i] / total) * 100, 1)
     return rows
 
 
