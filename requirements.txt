@@ -8,3 +8,4 @@ xgboost
 lightgbm
 fastf1
 joblib
+optuna

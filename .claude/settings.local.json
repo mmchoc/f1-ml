@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"const fs=require\\('fs'\\); const src=fs.readFileSync\\('src/App.js','utf8'\\); console.log\\('Lines:', src.split\\('\\\\n'\\).length\\); console.log\\('LiveTimingTab defined:', src.includes\\('function LiveTimingTab'\\)\\); console.log\\('timing tab rendered:', src.includes\\('tab === \\\\\"timing\\\\\"'\\)\\); console.log\\('timing tab button:', src.includes\\('\\\\\"timing\\\\\"'\\)\\); console.log\\('OF1 endpoints referenced:', \\(src.match\\(/OF1\\\\//g\\)||[]\\).length\\);\")",
+      "Bash(curl -s \"https://api.openf1.org/v1/sessions?year=2026&session_name=Race\")",
+      "Bash(python -m json.tool)",
+      "Bash(python:*)",
+      "Bash(node -e ':*)"
+    ]
+  }
+}
