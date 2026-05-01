@@ -11,6 +11,8 @@ Endpoints:
   GET /api/race/{round_num}                - pre-race win prediction
   GET /api/race/live/{round_num}           - live race prediction (OpenF1)
   GET /api/race/result/{round_num}         - store/get race result after finish
+  GET /api/weekend/{year}/{round_num}      - progressive weekend prediction
+  GET /api/weekend/{year}/{round_num}/update - refresh weekend prediction from OpenF1
 """
 
 import os
@@ -32,6 +34,7 @@ from model import (
     fetch_constructor_standings, fetch_fastf1_data,
     STREET_CIRCUITS, HIGH_SPEED_CIRCUITS, TECHNICAL_CIRCUITS
 )
+from weekend import build_weekend_prediction, get_race_name
 
 # ─── APP SETUP ────────────────────────────────────────────────────────────────
 app = FastAPI()
@@ -634,4 +637,73 @@ def race_result(round_num: int):
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+# ─── WEEKEND PREDICTION ───────────────────────────────────────────────────────
+
+def _build_ml_inputs(round_num: int):
+    """
+    Fetch standings, run predict_championship, and return
+    (ml_base_scores, driver_info, race_name) for the weekend endpoints.
+    """
+    if model is None:
+        return {}, {}, ""
+
+    standings    = get_standings_2026()
+    races        = get_races_2026()
+    constructors = fetch_constructor_standings(CURRENT_YEAR)
+
+    if not standings or not races:
+        return {}, {}, ""
+
+    champ_preds = predict_championship(
+        standings, races, constructors,
+        COMPLETED_ROUNDS, model, scaler, meta
+    )
+    if not champ_preds:
+        return {}, {}, ""
+
+    ml_base_scores = {p["driver"]: p["predicted_points"] for p in champ_preds}
+    driver_info    = {
+        p["driver"]: {
+            "team":           p["team"],
+            "current_points": p["current_points"],
+        }
+        for p in champ_preds
+    }
+    race_name = get_race_name(CURRENT_YEAR, round_num)
+    return ml_base_scores, driver_info, race_name
+
+
+@app.get("/api/weekend/{year}/{round_num}")
+def weekend_prediction(year: int, round_num: int):
+    """
+    Progressive race weekend prediction.
+    Returns the current blended prediction based on all completed sessions.
+    Uses a 5-minute cache; call /update to force a refresh.
+    """
+    ml_base_scores, driver_info, race_name = _build_ml_inputs(round_num)
+    if not ml_base_scores:
+        return {"error": "Model not loaded or standings unavailable"}
+
+    return build_weekend_prediction(
+        year, round_num, ml_base_scores, driver_info, race_name,
+        force_refresh=False,
+    )
+
+
+@app.get("/api/weekend/{year}/{round_num}/update")
+def update_weekend_prediction(year: int, round_num: int):
+    """
+    Force a fresh fetch from OpenF1 for all available sessions,
+    recompute the blended prediction, and return the updated state.
+    """
+    ml_base_scores, driver_info, race_name = _build_ml_inputs(round_num)
+    if not ml_base_scores:
+        return {"error": "Model not loaded or standings unavailable"}
+
+    return build_weekend_prediction(
+        year, round_num, ml_base_scores, driver_info, race_name,
+        force_refresh=True,
+    )
         

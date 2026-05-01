@@ -50,7 +50,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 fastf1.Cache.enable_cache(CACHE_DIR)
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-TRAIN_YEARS = list(range(2019, 2026))
+TRAIN_YEARS = list(range(2019, 2027))
 
 SEASON_WEIGHTS = {
     2019: 0.30,
@@ -60,6 +60,7 @@ SEASON_WEIGHTS = {
     2023: 0.90,
     2024: 0.95,
     2025: 1.00,
+    2026: 1.00,
 }
 
 MIN_ROUNDS_FOR_SNAPSHOT = 3
